@@ -105,6 +105,14 @@ impl PaymentState for AppState {
     }
 }
 
+fn should_use_auto_fee_payer_signer(
+    sandbox: bool,
+    network: &str,
+    signer_cfg: Option<&SignerConfig>,
+) -> bool {
+    sandbox || (signer_cfg.is_none() && matches!(network, "localnet" | "devnet"))
+}
+
 impl StartCommand {
     pub fn run(self, active_account_name: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
         let debugger = self.debugger || sandbox;
@@ -222,29 +230,34 @@ impl StartCommand {
             //
             // Lookup order, first match wins:
             //
-            //   1. **Explicit `operator.signer` in YAML** — user said
-            //      what they want, honor it. Handles GcpKms (build-
-            //      feature gated), Account (named entry in
-            //      accounts.yml), and File (JSON keypair on disk).
+            //   1. **`--sandbox` flag** — authoritative local dev mode.
+            //      Force a dedicated localnet gateway ephemeral from
+            //      accounts.yml regardless of the YAML's production
+            //      `operator.signer` / `operator.network`. This keeps
+            //      local sanity tests off real signers and makes the
+            //      emitted MPP challenges compatible with `pay --sandbox
+            //      curl`.
             //
-            //   2. **`--sandbox` flag** — forces a dedicated localnet
-            //      gateway ephemeral from accounts.yml regardless of
-            //      network. Lazy-creates on first use. Never touches the
-            //      keychain.
+            //   2. **Explicit `operator.signer` in YAML** — production
+            //      path. Handles GcpKms (build-feature gated), Account
+            //      (named entry in accounts.yml), and File (JSON keypair
+            //      on disk).
             //
-            //   3. **Throwaway network slug** (`localnet` / `devnet`) —
-            //      smart default: route through the network-aware
-            //      loader so users running `pay server start` against
-            //      a localnet/devnet spec don't have to think about
-            //      signers. Same code path as the sandbox flag.
+            //   3. **Throwaway network slug** (`localnet` / `devnet`)**
+            //      with no explicit signer** — smart default: route
+            //      through the network-aware loader so users running
+            //      `pay server start` against a localnet/devnet spec
+            //      don't have to think about signers. Same code path as
+            //      the sandbox flag.
             //
             //   4. **None** — leaves fee_payer_signer empty. Caught by
             //      the early-validation guard below if `fee_payer: true`.
-            let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = if let Some(ref cfg) = signer_cfg
-            {
-                Some(resolve_signer(cfg).await?)
-            } else if sandbox || matches!(network.as_str(), "localnet" | "devnet") {
-                let auto_network = if sandbox { "localnet" } else { network.as_str() };
+            let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = if should_use_auto_fee_payer_signer(
+                sandbox,
+                &network,
+                signer_cfg.as_ref(),
+            ) {
+                let auto_network = network.as_str();
                 let store = pay_core::accounts::FileAccountsStore::default_path();
                 let _ = pay_core::accounts::load_or_create_exact_ephemeral_for_network_as(
                     auto_network,
@@ -272,6 +285,8 @@ impl StartCommand {
                     );
                 }
                 Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
+            } else if let Some(ref cfg) = signer_cfg {
+                Some(resolve_signer(cfg).await?)
             } else if let Some(ref source) = active_account_name_owned {
                 // Mainnet (or unknown network) with no `operator.signer`
                 // block but a default keypair from `pay setup` —
@@ -1758,7 +1773,7 @@ fn gateway_charge_challenges(
 mod tests {
     use super::{
         build_pdb_config, explorer_cluster_query, resolve_currency, resolve_operator_currencies,
-        validate_browser_rpc_request,
+        should_use_auto_fee_payer_signer, validate_browser_rpc_request,
     };
 
     #[test]
@@ -1930,6 +1945,27 @@ endpoints:
         );
 
         assert_eq!(config["rpcUrl"], "https://402.surfnet.dev:8899");
+    }
+
+    #[test]
+    fn sandbox_prefers_auto_fee_payer_signer_even_with_explicit_signer() {
+        let signer = SignerConfig::GcpKms {
+            key_name: "projects/x/locations/y/keyRings/z/cryptoKeys/a/cryptoKeyVersions/1"
+                .to_string(),
+            pubkey: VALID_TEST_KEYPAIR_PUBKEY.to_string(),
+        };
+
+        assert!(should_use_auto_fee_payer_signer(
+            true,
+            "localnet",
+            Some(&signer),
+        ));
+        assert!(!should_use_auto_fee_payer_signer(
+            false,
+            "mainnet",
+            Some(&signer),
+        ));
+        assert!(should_use_auto_fee_payer_signer(false, "devnet", None));
     }
 
     // ── resolve_signer (operator.signer in YAML) ───────────────────────────
