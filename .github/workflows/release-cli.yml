@@ -139,6 +139,14 @@ jobs:
         if: matrix.use-cross
         run: cp -R ../pdb/dist pdb-dist
 
+      - name: Configure cross env passthrough
+        if: matrix.use-cross
+        run: |
+          cat > Cross.toml <<'EOF'
+          [build.env]
+          passthrough = ["PAY_PDB_DIST", "PAY_PDB_ALLOW_PLACEHOLDER"]
+          EOF
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
