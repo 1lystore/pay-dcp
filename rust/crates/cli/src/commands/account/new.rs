@@ -1,8 +1,14 @@
 //! `pay account new` — generate a fresh keypair and store it.
 
+use std::time::Duration;
+
 use dialoguer::Select;
 use owo_colors::OwoColorize;
+use pay_core::accounts::{AccountsFile, MAINNET_NETWORK};
+use pay_core::dcp_signer::DEFAULT_DCP_URL;
 use pay_core::keystore::Keystore;
+use serde::Deserialize;
+use solana_pubkey::Pubkey;
 
 /// Generate a new keypair and store it securely.
 #[derive(clap::Args)]
@@ -11,7 +17,7 @@ pub struct NewCommand {
     pub name: String,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// or "windows-hello" (Windows).
+    /// "windows-hello" (Windows), or "dcp".
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -63,6 +69,10 @@ pub fn create_account(
         None => pick_backend()?,
     };
 
+    if backend_id == "dcp" {
+        return create_dcp_account(name, force);
+    }
+
     let (ks, keystore_kind, backend_display, op_info) = build_keystore(&backend_id, vault)?;
 
     if ks.exists(name) && !force {
@@ -86,6 +96,7 @@ pub fn create_account(
             keystore_kind,
             &pubkey_b58,
             op_info.as_ref().and_then(|i| i.vault.clone()),
+            None,
             None,
             op_info.as_ref().and_then(|i| i.account.clone()),
         )?;
@@ -113,6 +124,7 @@ pub fn create_account(
             .as_ref()
             .and_then(|i| i.vault.clone())
             .or(vault.map(|v| v.to_string())),
+        None,
         None,
         op_info.as_ref().and_then(|i| i.account.clone()),
     )?;
@@ -216,17 +228,115 @@ fn build_keystore(
     }
 }
 
+fn create_dcp_account(name: &str, force: bool) -> pay_core::Result<(String, &'static str)> {
+    let network = account_network();
+    let accounts = AccountsFile::load()?;
+    if accounts.named_account_for_network(&network, name).is_some() && !force {
+        crate::components::print_notice(
+            crate::components::NoticeLevel::Info,
+            "Account already exists",
+            &format!("`{name}` is already registered for `{network}`.\nUse --force to replace it."),
+        );
+        let account = accounts
+            .named_account_for_network(&network, name)
+            .expect("checked account existence");
+        let pubkey = account.pubkey.clone().ok_or_else(|| {
+            pay_core::Error::Config(format!(
+                "Account `{name}` is registered for `{network}` but has no public key"
+            ))
+        })?;
+        return Ok((pubkey, "DCP"));
+    }
+
+    let dcp_url = configured_dcp_url();
+    let pubkey_b58 = fetch_dcp_pubkey(&dcp_url)?;
+    save_dcp_account(name, &pubkey_b58, &dcp_url)?;
+    Ok((pubkey_b58, "DCP"))
+}
+
+fn save_dcp_account(name: &str, pubkey: &str, dcp_url: &str) -> pay_core::Result<()> {
+    let mut accounts = pay_core::accounts::AccountsFile::load()?;
+    for network in [MAINNET_NETWORK, "localnet", "devnet"] {
+        accounts.upsert(
+            network,
+            name,
+            pay_core::accounts::Account {
+                keystore: pay_core::accounts::Keystore::Dcp,
+                active: false,
+                auth_required: Some(false),
+                pubkey: Some(pubkey.to_string()),
+                vault: None,
+                account: None,
+                path: None,
+                dcp_url: Some(dcp_url.to_string()),
+                secret_key_b58: None,
+                created_at: None,
+            },
+        );
+    }
+    accounts.save()
+}
+
+fn configured_dcp_url() -> String {
+    std::env::var("DCP_URL")
+        .or_else(|_| std::env::var("PAY_DCP_URL"))
+        .unwrap_or_else(|_| DEFAULT_DCP_URL.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+#[derive(Deserialize)]
+struct DcpAddressResponse {
+    address: String,
+}
+
+fn fetch_dcp_pubkey(dcp_url: &str) -> pay_core::Result<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| pay_core::Error::Config(format!("Failed to create HTTP client: {e}")))?;
+
+    let health = client
+        .get(format!("{dcp_url}/health"))
+        .send()
+        .map_err(|e| pay_core::Error::Config(format!("DCP is not reachable at {dcp_url}: {e}")))?;
+    if !health.status().is_success() {
+        return Err(pay_core::Error::Config(format!(
+            "DCP health check failed at {dcp_url}: {}",
+            health.status()
+        )));
+    }
+
+    let address = client
+        .get(format!("{dcp_url}/address/solana"))
+        .send()
+        .map_err(|e| pay_core::Error::Config(format!("DCP address lookup failed: {e}")))?;
+    if !address.status().is_success() {
+        return Err(pay_core::Error::Config(format!(
+            "DCP address lookup returned {}. Open and unlock DCP first.",
+            address.status()
+        )));
+    }
+    let body: DcpAddressResponse = address
+        .json()
+        .map_err(|e| pay_core::Error::Config(format!("DCP address response invalid: {e}")))?;
+    body.address.parse::<Pubkey>().map_err(|e| {
+        pay_core::Error::Config(format!("DCP returned an invalid Solana address: {e}"))
+    })?;
+    Ok(body.address)
+}
+
 /// Comma-separated list of backends that work on the current OS.
 /// Used in error messages so we don't suggest `keychain` to a Linux user.
 fn available_backends_hint() -> &'static str {
     if cfg!(target_os = "macos") {
-        "'keychain'"
+        "'keychain' or 'dcp'"
     } else if cfg!(target_os = "linux") {
-        "'gnome-keyring'"
+        "'gnome-keyring' or 'dcp'"
     } else if cfg!(target_os = "windows") {
-        "'windows-hello'"
+        "'windows-hello' or 'dcp'"
     } else {
-        "a supported platform backend"
+        "'dcp' or a supported platform backend"
     }
 }
 
@@ -348,11 +458,13 @@ pub fn save_account(
     pubkey: &str,
     vault: Option<String>,
     path: Option<String>,
+    dcp_url: Option<String>,
     account: Option<String>,
 ) -> pay_core::Result<()> {
     let mut accounts = pay_core::accounts::AccountsFile::load()?;
+    let network = account_network();
     accounts.upsert(
-        pay_core::accounts::MAINNET_NETWORK,
+        &network,
         name,
         pay_core::accounts::Account {
             keystore,
@@ -362,11 +474,19 @@ pub fn save_account(
             vault,
             account,
             path,
+            dcp_url,
             secret_key_b58: None,
             created_at: None,
         },
     );
     accounts.save()
+}
+
+fn account_network() -> String {
+    std::env::var("PAY_NETWORK_ENFORCED")
+        .ok()
+        .filter(|network| !network.trim().is_empty())
+        .unwrap_or_else(|| MAINNET_NETWORK.to_string())
 }
 
 /// Print the post-setup summary and next-step hints.

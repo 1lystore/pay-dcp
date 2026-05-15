@@ -223,6 +223,7 @@ fn keystore_for_kind(
         )),
 
         KeystoreKind::OnePassword => Ok(Some(Keystore::onepassword(op_account))),
+        KeystoreKind::Dcp => Ok(None),
         KeystoreKind::File => Ok(None),
         // Ephemeral keypairs live entirely inside accounts.yml — there's
         // no external keystore to delete from. The earlier `accounts.remove`
@@ -246,6 +247,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 vault: None,
                 account: None,
                 path: None,
+                dcp_url: None,
                 secret_key_b58: None,
                 created_at: None,
             });
@@ -265,6 +267,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 vault: None,
                 account: None,
                 path: None,
+                dcp_url: None,
                 secret_key_b58: None,
                 created_at: None,
             });
@@ -283,6 +286,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 vault: None,
                 account: None,
                 path: None,
+                dcp_url: None,
                 secret_key_b58: None,
                 created_at: None,
             });

@@ -475,6 +475,7 @@ mod tests {
                 vault: None,
                 account: None,
                 path: None,
+                dcp_url: None,
                 secret_key_b58: Some(bs58::encode(keypair.to_bytes()).into_string()),
                 created_at: Some("2026-04-19T00:00:00Z".to_string()),
             },

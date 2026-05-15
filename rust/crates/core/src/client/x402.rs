@@ -118,12 +118,20 @@ pub fn build_payment(
     let user_opted_into_sandbox = network_override.is_some() || cluster == "localnet";
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
-    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_payment_with_intent(
+    let (signer, ephemeral_notice) = crate::signer::load_payment_signer_for_network_with_intent(
         &network,
         store,
         account_override,
         &amount,
         &intent,
+        crate::signer::PaymentSigningContext {
+            protocol: crate::signer::PaymentProtocol::X402,
+            amount: requirements.amount.to_string(),
+            currency: requirements.currency.to_string(),
+            recipient: Some(requirements.recipient.clone()),
+            resource: Some(requirements.resource.clone()),
+            purpose: prompt_context.reason.clone().into(),
+        },
     )?;
 
     let rpc_url =
@@ -158,20 +166,21 @@ pub fn build_payment(
     let (payment_header_name, payment_header_value) = match challenge.x402_version {
         X402_VERSION_V1 => {
             let header = rt
-                .block_on(build_payment_header_v1(&signer, &rpc, requirements))
+                .block_on(build_payment_header_v1(&*signer, &rpc, requirements))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
             (X402_V1_PAYMENT_HEADER, header)
         }
         _ => {
             let header = rt
-                .block_on(build_payment_header_v2(&signer, &rpc, requirements))
+                .block_on(build_payment_header_v2(&*signer, &rpc, requirements))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
             (X402_V2_PAYMENT_HEADER, header)
         }
     };
 
     let mut headers = vec![(payment_header_name, payment_header_value)];
-    if let Some((header_name, header_value)) = build_siwx_header(challenge, &signer, &network, &rt)?
+    if let Some((header_name, header_value)) =
+        build_siwx_header(challenge, &*signer, &network, &rt)?
     {
         headers.push((header_name, header_value));
     }
@@ -858,6 +867,7 @@ mod tests {
             vault: None,
             account: None,
             path: None,
+            dcp_url: None,
             secret_key_b58: Some(bs58::encode(TEST_KEYPAIR_BYTES).into_string()),
             created_at: Some("2026-04-27T00:00:00Z".to_string()),
         };

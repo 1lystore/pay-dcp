@@ -1,6 +1,7 @@
 // Shared modules
 pub mod accounts;
 pub mod config;
+pub mod dcp_signer;
 pub mod error;
 pub mod instructions;
 pub mod keystore;

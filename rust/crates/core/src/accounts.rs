@@ -70,6 +70,7 @@ pub enum Keystore {
     GnomeKeyring,
     WindowsHello,
     OnePassword,
+    Dcp,
     File,
     /// Inline ephemeral keypair stored directly in this file. Used for
     /// throwaway test wallets on sandbox/devnet/localnet.
@@ -83,6 +84,7 @@ impl std::fmt::Display for Keystore {
             Keystore::GnomeKeyring => write!(f, "gnome-keyring"),
             Keystore::WindowsHello => write!(f, "windows-hello"),
             Keystore::OnePassword => write!(f, "1password"),
+            Keystore::Dcp => write!(f, "dcp"),
             Keystore::File => write!(f, "file"),
             Keystore::Ephemeral => write!(f, "ephemeral"),
         }
@@ -128,6 +130,10 @@ pub struct Account {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
+    /// DCP vault URL (only for `keystore: dcp`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dcp_url: Option<String>,
+
     /// Base58-encoded full keypair (64 bytes: secret || public). Only set
     /// for `keystore: ephemeral` — these wallets live entirely in this
     /// file with no external secret storage.
@@ -158,6 +164,7 @@ impl Account {
             Keystore::GnomeKeyring => Some(format!("gnome-keyring:{name}")),
             Keystore::WindowsHello => Some(format!("windows-hello:{name}")),
             Keystore::OnePassword => Some(format!("1password:{name}")),
+            Keystore::Dcp => None,
             Keystore::File => Some(
                 self.path
                     .clone()
@@ -568,6 +575,7 @@ fn generate_ephemeral_account() -> Account {
         vault: None,
         account: None,
         path: None,
+        dcp_url: None,
         secret_key_b58: Some(bs58::encode(&full).into_string()),
         created_at: Some(now_rfc3339()),
     }
@@ -639,6 +647,7 @@ mod tests {
             pubkey: Some(pubkey.to_string()),
             vault: None,
             path: None,
+            dcp_url: None,
             account: None,
             secret_key_b58: None,
             created_at: None,
@@ -654,6 +663,7 @@ mod tests {
             vault: None,
             account: None,
             path: None,
+            dcp_url: None,
             secret_key_b58: Some("test-secret-bytes-base58".to_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
         }
@@ -707,6 +717,7 @@ mod tests {
             pubkey: None,
             vault: None,
             path: Some("/home/me/.config/solana/id.json".to_string()),
+            dcp_url: None,
             account: None,
             secret_key_b58: None,
             created_at: None,
@@ -726,6 +737,7 @@ mod tests {
             pubkey: None,
             vault: None,
             path: None,
+            dcp_url: None,
             account: None,
             secret_key_b58: None,
             created_at: None,
@@ -747,6 +759,7 @@ mod tests {
             vault: None,
             account: None,
             path: None,
+            dcp_url: None,
             secret_key_b58: Some(bs58::encode(&raw_bytes).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
         };

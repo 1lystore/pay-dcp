@@ -1,14 +1,38 @@
 //! Resolve a signer from a keypair source — file path, Keychain, or 1Password.
 
-use solana_mpp::solana_keychain::MemorySigner;
+use solana_mpp::solana_keychain::{MemorySigner, SolanaSigner};
 
 use crate::accounts::{
     Account, AccountChoice, AccountsStore, Keystore, ResolvedEphemeral,
     load_or_create_ephemeral_for_network, load_or_create_ephemeral_for_network_as,
     resolve_account_for_network,
 };
+use crate::dcp_signer::{DEFAULT_DCP_URL, DcpPaymentContext, DcpSigner};
 use crate::keystore::AuthIntent;
 use crate::{Error, Result};
+
+pub enum PaymentProtocol {
+    Mpp,
+    X402,
+}
+
+impl PaymentProtocol {
+    fn as_str(&self) -> &'static str {
+        match self {
+            PaymentProtocol::Mpp => "mpp",
+            PaymentProtocol::X402 => "x402",
+        }
+    }
+}
+
+pub struct PaymentSigningContext {
+    pub protocol: PaymentProtocol,
+    pub amount: String,
+    pub currency: String,
+    pub recipient: Option<String>,
+    pub resource: Option<String>,
+    pub purpose: Option<String>,
+}
 
 /// Load a `MemorySigner` from the given source.
 ///
@@ -151,6 +175,82 @@ pub fn load_signer_for_network_payment_with_intent(
     })
 }
 
+pub fn load_payment_signer_for_network_with_intent(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+    amount: &str,
+    intent: &AuthIntent,
+    context: PaymentSigningContext,
+) -> Result<(Box<dyn SolanaSigner>, Option<ResolvedEphemeral>)> {
+    let file = store.load()?;
+    let resolved = if let Some(name) = account_override {
+        if let Some(account) = file.named_account_for_network(network, name).cloned() {
+            Some((name.to_string(), account))
+        } else if is_lazy_ephemeral_network(network) {
+            let resolved = load_or_create_ephemeral_for_network_as(network, name, store)?;
+            let signer = signer_from_ephemeral(&resolved.account)?;
+            return Ok((Box::new(signer), Some(resolved)));
+        } else {
+            return Err(Error::Config(format!(
+                "No account named `{name}` configured for network `{network}`."
+            )));
+        }
+    } else {
+        match resolve_account_for_network(network, &file) {
+            AccountChoice::Resolved { name, account } => Some((name, account)),
+            AccountChoice::Missing => {
+                if is_lazy_ephemeral_network(network) {
+                    let resolved = load_or_create_ephemeral_for_network(network, store)?;
+                    let signer = signer_from_ephemeral(&resolved.account)?;
+                    return Ok((Box::new(signer), Some(resolved)));
+                }
+                return Err(Error::Config(format!(
+                    "No account configured for network `{network}`.\n\n\
+                     Run `pay setup` to create an account."
+                )));
+            }
+        }
+    };
+
+    let (name, account) = resolved.expect("account resolution should have returned or errored");
+    if account.keystore == Keystore::Dcp {
+        let dcp_url = account
+            .dcp_url
+            .clone()
+            .or_else(|| account.path.clone())
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_DCP_URL.to_string());
+        let pubkey = account.pubkey.clone();
+        let dcp_context = DcpPaymentContext {
+            protocol: context.protocol.as_str().to_string(),
+            amount: context.amount,
+            currency: context.currency,
+            recipient: context.recipient,
+            resource: context.resource,
+            purpose: context.purpose,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| Error::Mpp(format!("Failed to create DCP runtime: {e}")))?;
+        let signer = rt
+            .block_on(DcpSigner::connect(dcp_url, pubkey, "Pay.sh"))
+            .map_err(|e| Error::Config(format!("DCP signer: {e}")))?
+            .with_context(dcp_context);
+        return Ok((Box::new(signer), None));
+    }
+
+    load_signer_from_account_with_intent(&account, &name, network, intent)
+        .map(|signer| (Box::new(signer) as Box<dyn SolanaSigner>, None))
+        .map_err(|e| match e {
+            Error::PaymentRejected(where_) => {
+                Error::PaymentRejected(format!("{amount} payment authorization was {where_}"))
+            }
+            other => other,
+        })
+}
+
 /// Networks where missing-entry → auto-generate-an-ephemeral is a safe
 /// default. Real money networks are NOT in this list — we refuse to
 /// silently create a mainnet wallet.
@@ -189,6 +289,11 @@ pub fn load_keypair_bytes_from_account_with_intent(
                     "Ephemeral account is missing its inline `secret_key_b58` field".to_string(),
                 )
             });
+    }
+    if account.keystore == Keystore::Dcp {
+        return Err(Error::Config(
+            "DCP accounts are remote signers and do not expose keypair bytes".to_string(),
+        ));
     }
 
     let source = account
@@ -274,6 +379,9 @@ pub fn load_keypair_bytes_from_account_with_intent(
             ks.load_keypair_with_intent(name, &account_intent)
                 .map_err(|e| map_keystore_backend_error("1password", e))
         }
+        Keystore::Dcp => Err(Error::Config(
+            "DCP accounts are remote signers and do not expose keypair bytes".to_string(),
+        )),
         Keystore::File => load_signer_keypair_bytes_with_intent(&source, &account_intent),
         Keystore::Ephemeral => unreachable!("handled above"),
     }
@@ -646,6 +754,7 @@ mod tests {
             vault: None,
             account: None,
             path: None,
+            dcp_url: None,
             secret_key_b58: Some(bs58::encode(&full).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
         }
@@ -815,6 +924,7 @@ mod tests {
             pubkey: None,
             vault: None,
             path: None,
+            dcp_url: None,
             account: None,
             secret_key_b58: None,
             created_at: None,

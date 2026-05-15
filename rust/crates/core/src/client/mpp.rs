@@ -5,7 +5,6 @@
 use pay_types::Stablecoin;
 use solana_mpp::client::build_credential_header;
 use solana_mpp::protocol::solana::default_rpc_url;
-use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
 use solana_mpp::{ChargeRequest, parse_www_authenticate_all};
 use tracing::{info, warn};
@@ -113,12 +112,27 @@ pub fn build_credential(
         .map(str::to_string)
         .unwrap_or(challenge_network);
 
-    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_payment_with_intent(
+    let recipient = request
+        .method_details
+        .as_ref()
+        .and_then(|v| v.get("recipient"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let (dcp_amount, dcp_currency) = dcp_budget_amount_and_currency(&request);
+    let (signer, ephemeral_notice) = crate::signer::load_payment_signer_for_network_with_intent(
         &network,
         store,
         account_override,
         &amount,
         &intent,
+        crate::signer::PaymentSigningContext {
+            protocol: crate::signer::PaymentProtocol::Mpp,
+            amount: dcp_amount,
+            currency: dcp_currency,
+            recipient,
+            resource: resource_url.map(str::to_string),
+            purpose: Some(prompt_context.reason.clone()),
+        },
     )?;
 
     let rpc_url = resolve_rpc_url(&network, embedded_blockhash);
@@ -153,7 +167,7 @@ pub fn build_credential(
     }
 
     let header = rt
-        .block_on(build_credential_header(&signer, &rpc, challenge))
+        .block_on(build_credential_header(&*signer, &rpc, challenge))
         .map_err(|e| Error::Mpp(format!("Failed to build credential: {e}")))?;
 
     Ok((header, ephemeral_notice))
@@ -455,6 +469,47 @@ fn format_amount(amount: &str, currency: &str) -> String {
     format!("${}", format_value(value))
 }
 
+fn dcp_budget_amount_and_currency(request: &ChargeRequest) -> (String, String) {
+    let currency = if let Some(symbol) = Stablecoin::symbol_for_mint(&request.currency) {
+        symbol.to_string()
+    } else {
+        request.currency.clone()
+    };
+    let decimals = request
+        .method_details
+        .as_ref()
+        .and_then(|v| v.get("decimals"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| {
+            if currency.eq_ignore_ascii_case("SOL") {
+                9
+            } else {
+                6
+            }
+        }) as usize;
+    (format_base_units(&request.amount, decimals), currency)
+}
+
+fn format_base_units(amount: &str, decimals: usize) -> String {
+    let Ok(base) = amount.parse::<u128>() else {
+        return "0".to_string();
+    };
+    if decimals == 0 {
+        return base.to_string();
+    }
+    let scale = 10u128.saturating_pow(decimals as u32);
+    let whole = base / scale;
+    let fractional = base % scale;
+    if fractional == 0 {
+        return whole.to_string();
+    }
+    let mut fraction = format!("{fractional:0decimals$}");
+    while fraction.ends_with('0') {
+        fraction.pop();
+    }
+    format!("{whole}.{fraction}")
+}
+
 fn format_value(v: f64) -> String {
     if v == 0.0 {
         "0".to_string()
@@ -548,6 +603,25 @@ mod tests {
     #[test]
     fn format_amount_invalid() {
         assert_eq!(format_amount("not_a_number", "USDC"), "$0");
+    }
+
+    #[test]
+    fn dcp_budget_amount_formats_base_units() {
+        assert_eq!(format_base_units("10000", 6), "0.01");
+        assert_eq!(format_base_units("1000000", 6), "1");
+        assert_eq!(format_base_units("123456789", 9), "0.123456789");
+    }
+
+    #[test]
+    fn dcp_budget_amount_maps_stablecoin_mint_to_symbol() {
+        let challenge =
+            challenge_for_currency(solana_mpp::protocol::solana::mints::USDC_MAINNET, "10000");
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+
+        assert_eq!(
+            dcp_budget_amount_and_currency(&request),
+            ("0.01".to_string(), "USDC".to_string())
+        );
     }
 
     #[test]

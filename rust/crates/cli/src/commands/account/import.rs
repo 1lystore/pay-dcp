@@ -105,6 +105,7 @@ impl ImportCommand {
                 pubkey: Some(pubkey_b58),
                 vault: self.vault,
                 path: None,
+                dcp_url: None,
                 account: None,
                 secret_key_b58: None,
                 created_at: None,
